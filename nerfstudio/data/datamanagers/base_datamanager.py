@@ -47,6 +47,7 @@ from nerfstudio.data.dataparsers.phototourism_dataparser import (
     PhototourismDataParserConfig,
 )
 from nerfstudio.data.dataparsers.record3d_dataparser import Record3DDataParserConfig
+from nerfstudio.data.dataparsers.scannet_dataparser import ScanNetDataParserConfig
 from nerfstudio.data.datasets.base_dataset import InputDataset
 from nerfstudio.data.pixel_samplers import EquirectangularPixelSampler, PixelSampler
 from nerfstudio.data.utils.dataloaders import (
@@ -72,6 +73,7 @@ AnnotatedDataParserUnion = tyro.conf.OmitSubcommandPrefixes[  # Omit prefixes of
             "record3d-data": Record3DDataParserConfig(),
             "dnerf-data": DNeRFDataParserConfig(),
             "phototourism-data": PhototourismDataParserConfig(),
+            "scannet-data": ScanNetDataParserConfig(),
         },
         prefix_names=False,  # Omit prefixes in subcommands themselves.
     )
