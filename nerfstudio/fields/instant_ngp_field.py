@@ -134,6 +134,27 @@ class TCNNInstantNGPField(Field):
             },
         )
 
+    def get_outputs_from_position(self, positions: TensorType, directions: TensorType):
+        """TODO"""
+        positions_flat = positions.view(-1, 3)
+        positions_flat = contract(x=positions_flat, roi=self.aabb, type=self.contraction_type)
+
+        h = self.mlp_base(positions_flat)
+        density_before_activation, density_embedding = torch.split(h, [1, self.geo_feat_dim], dim=-1)
+
+        # Rectifying the density with an exponential is much more stable than a ReLU or
+        # softplus, because it enables high post-activation (float32) density outputs
+        # from smaller internal (float16) parameters.
+        density = trunc_exp(density_before_activation.to(positions))
+
+        directions = get_normalized_directions(directions)
+        directions_flat = directions.view(-1, 3)
+        directions_enc = self.direction_encoding(directions_flat)
+
+        h = torch.cat([directions_enc, density_embedding], dim=-1)
+        rgb = self.mlp_head(h).to(directions)
+        return density, rgb
+
     def get_density(self, ray_samples: RaySamples):
         positions = ray_samples.frustums.get_positions()
         positions_flat = positions.view(-1, 3)

@@ -39,6 +39,129 @@ class Exporter:
 
 
 @dataclass
+class ExportVoxelDensity(Exporter):
+    """Export occupancy Density."""
+
+    number_voxel: Tuple[int, int, int] = (256, 256, 128)
+    """Output voxel size."""
+    bounding_box_min: Tuple[float, float, float] = (-1, -1, -1)
+    """Minimum of the bounding box."""
+    bounding_box_max: Tuple[float, float, float] = (1, 1, 1)
+    """Maximum of the bounding box."""
+    sample_points_per_voxel: int = 128
+    """Number of sample points to determine the density of each voxels."""
+    vis_alpha_thres: float = 0.99
+    """Alpha threshold."""
+    eval_chunk_size: int = 409600
+
+    def __post_init__(self):
+        number_voxel, voxel_size, xyz_min, xyz_max = self._compute_world_meta()
+        self.number_voxel = number_voxel
+        self.voxel_size = voxel_size
+        self.xyz_min = xyz_min
+        self.xyz_max = xyz_max
+
+    def main(self) -> None:
+        """Export occupancy grid."""
+        if not self.output_dir.exists():
+            self.output_dir.mkdir(parents=True)
+
+        _, pipeline, _ = eval_setup(self.load_config)
+        # (H * W * D, 3)
+        pts = self._compute_voxel_grids()
+        # (H * W * D, # of samples, 3)
+        positions, views = self._create_voxel_samples(pts)
+
+        _, num_sample_points_per_voxel, _ = positions.shape
+        alpha_all = []
+        color_all = []
+        with torch.no_grad():
+            position_chunks = torch.split(positions, self.eval_chunk_size, dim=0)
+            views_chunks = torch.split(views, self.eval_chunk_size, dim=0)
+            for i, (pos, vw) in enumerate(zip(position_chunks, views_chunks)):
+                CONSOLE.print(f"Extracting chunk {i+1}/{len(position_chunks)}...")
+                density, color = pipeline.model.field.get_outputs_from_position(
+                    pos.to(pipeline.model.device), vw.to(pipeline.model.device)
+                )
+                density = density.reshape(-1, num_sample_points_per_voxel)
+                alpha = 1.0 - torch.exp(-density)
+                color = color.reshape(-1, num_sample_points_per_voxel, 3)
+                alpha_all.append(alpha.mean(dim=-1).cpu())
+                color_all.append(color.mean(dim=-2).cpu())
+
+        alpha = torch.cat(alpha_all, dim=0)
+        color = torch.cat(color_all, dim=0)
+
+        voxel_position = pts.float().numpy()
+        voxel_alpha = alpha.float().numpy()
+        voxel_color = color.float().numpy()
+
+        mask = voxel_alpha > self.vis_alpha_thres
+        voxel_position = voxel_position[mask]
+        voxel_alpha = voxel_alpha[mask]
+        voxel_color = voxel_color[mask]
+
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(voxel_position)
+        pcd.colors = o3d.utility.Vector3dVector(voxel_color)
+
+        torch.cuda.empty_cache()
+
+        CONSOLE.print(f"[bold green]:white_check_mark: Generated {pcd}")
+        CONSOLE.print("Saving voxels...")
+        o3d.io.write_point_cloud(str(self.output_dir / "voxel.ply"), pcd)
+        print("\033[A\033[A")
+        CONSOLE.print("[bold green]:white_check_mark: Saving voxel")
+
+    def _compute_world_meta(self):
+        number_voxel = torch.tensor(self.number_voxel).long()
+        xyz_min = torch.tensor(self.bounding_box_min).float()
+        xyz_max = torch.tensor(self.bounding_box_max).float()
+        scene_length = xyz_max - xyz_min
+        voxel_size = scene_length / number_voxel
+        return (number_voxel, voxel_size, xyz_min, xyz_max)
+
+    def _compute_sample_offsets(self):
+        torch.random.manual_seed(1028)
+        # [0, 1)
+        offs = torch.rand(self.sample_points_per_voxel, 3)
+        # [-1, 1)
+        offs = offs * 2 - 1
+        # Sample around center
+        offs = 0.5 * offs
+        # [-voxel_size/2, voxel_size/2)
+        offs = offs * self.voxel_size / 2.0
+        return offs
+
+    def _compute_voxel_grids(self):
+        x, y, z = torch.meshgrid(
+            torch.linspace(0, self.number_voxel[0] - 1, self.number_voxel[0]),
+            torch.linspace(0, self.number_voxel[1] - 1, self.number_voxel[1]),
+            torch.linspace(0, self.number_voxel[2] - 1, self.number_voxel[2]),
+            indexing="ij",
+        )
+        # (H * W * D, 3)
+        pts = torch.stack([x, y, z], dim=-1).reshape(-1, 3)
+        # Scale the points to fit the scene
+        pts = pts * self.voxel_size
+        # Shift the min point to xyz_min
+        pts = pts + self.xyz_min
+        # Shift each point to the center of voxels
+        pts = pts + self.voxel_size / 2.0
+        return pts
+
+    @torch.no_grad()
+    def _create_voxel_samples(self, pts):
+        # Make samples for each voxel
+        offs = self._compute_sample_offsets()
+        # (H * W * D, # samples, 3)
+        pts = pts.unsqueeze(-2) + offs
+        views = -offs
+        views = views / views.norm(dim=-1, keepdim=True)
+        return pts, views.expand(pts.shape)
+
+
+@dataclass
 class ExportPointCloud(Exporter):
     """Export NeRF as a point cloud."""
 
@@ -315,6 +438,7 @@ class ExportMarchingCubesMesh(Exporter):
 
 
 Commands = Union[
+    Annotated[ExportVoxelDensity, tyro.conf.subcommand(name="voxel")],
     Annotated[ExportPointCloud, tyro.conf.subcommand(name="pointcloud")],
     Annotated[ExportTSDFMesh, tyro.conf.subcommand(name="tsdf")],
     Annotated[ExportPoissonMesh, tyro.conf.subcommand(name="poisson")],
