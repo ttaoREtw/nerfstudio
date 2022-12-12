@@ -21,7 +21,7 @@ import dataclasses
 import functools
 import os
 import time
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from rich.console import Console
@@ -83,6 +83,8 @@ class Trainer:
         self._start_step = 0
         # optimizers
         self.grad_scaler = GradScaler(enabled=self.mixed_precision)
+        # the best validation score of current checkpoints
+        self._best_val_score = -1e8
 
         self.base_dir = config.get_base_dir()
         # directory to save checkpoints
@@ -174,11 +176,11 @@ class Trainer:
                 self.eval_iteration(step)
 
                 if step_check(step, self.config.trainer.steps_per_save):
-                    self.save_checkpoint(step)
+                    self.save_checkpoint(step, force_save=True)
 
                 writer.write_out_storage()
             # save checkpoint at the end of training
-            self.save_checkpoint(step)
+            self.save_checkpoint(step, force_save=True, delete_others=self.config.trainer.save_only_latest_checkpoint)
 
             CONSOLE.rule()
             CONSOLE.print("[bold green]:tada: :tada: :tada: Training Finished :tada: :tada: :tada:", justify="center")
@@ -257,13 +259,16 @@ class Trainer:
         if load_dir is not None:
             load_step = self.config.trainer.load_step
             if load_step is None:
-                print("Loading latest checkpoint from load_dir")
-                # NOTE: this is specific to the checkpoint name format
-                load_step = sorted(int(x[x.find("-") + 1 : x.find(".")]) for x in os.listdir(load_dir))[-1]
-            load_path = load_dir / f"step-{load_step:09d}.ckpt"
+                # print("Loading latest checkpoint from load_dir")
+                # # NOTE: this is specific to the checkpoint name format
+                # load_step = sorted(int(x[x.find("-") + 1 : x.find(".")]) for x in os.listdir(load_dir))[-1]
+                load_path = load_dir / "step-best-val.ckpt"
+            else:
+                load_path = load_dir / f"step-{load_step:09d}.ckpt"
             assert load_path.exists(), f"Checkpoint {load_path} does not exist"
             loaded_state = torch.load(load_path, map_location="cpu")
             self._start_step = loaded_state["step"] + 1
+            self._best_val_score = loaded_state["score"]
             # load the checkpoints for pipeline, optimizers, and gradient scalar
             self.pipeline.load_pipeline(loaded_state["pipeline"])
             self.optimizers.load_optimizers(loaded_state["optimizers"])
@@ -273,7 +278,9 @@ class Trainer:
             CONSOLE.print("No checkpoints to load, training from scratch")
 
     @check_main_thread
-    def save_checkpoint(self, step: int) -> None:
+    def save_checkpoint(
+        self, step: int, score: Optional[float] = None, force_save: bool = False, delete_others: bool = False
+    ) -> None:
         """Save the model and optimizers
 
         Args:
@@ -282,25 +289,38 @@ class Trainer:
         # possibly make the checkpoint directory
         if not self.checkpoint_dir.exists():
             self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        # save the checkpoint
-        ckpt_path = self.checkpoint_dir / f"step-{step:09d}.ckpt"
-        torch.save(
-            {
-                "step": step,
-                "pipeline": self.pipeline.module.state_dict()  # type: ignore
-                if hasattr(self.pipeline, "module")
-                else self.pipeline.state_dict(),
-                "optimizers": {k: v.state_dict() for (k, v) in self.optimizers.optimizers.items()},
-                "scalers": self.grad_scaler.state_dict(),
-            },
-            ckpt_path,
-        )
-        # possibly delete old checkpoints
-        if self.config.trainer.save_only_latest_checkpoint:
-            # delete everything else in the checkpoint folder
-            for f in self.checkpoint_dir.glob("*"):
-                if f != ckpt_path:
-                    f.unlink()
+
+        is_better_ckpt = False
+        if score is not None and score > self._best_val_score:
+            self._best_val_score = score
+            is_better_ckpt = True
+
+        if force_save or is_better_ckpt:
+            # save the checkpoint
+            if is_better_ckpt:
+                ckpt_path = self.checkpoint_dir / "step-best-val.ckpt"
+            else:
+                ckpt_path = self.checkpoint_dir / f"step-{step:09d}.ckpt"
+            CONSOLE.log(f"Save checkpoint {ckpt_path} with score {score}.")
+            torch.save(
+                {
+                    "step": step,
+                    "score": self._best_val_score,
+                    "pipeline": self.pipeline.module.state_dict()  # type: ignore
+                    if hasattr(self.pipeline, "module")
+                    else self.pipeline.state_dict(),
+                    "optimizers": {k: v.state_dict() for (k, v) in self.optimizers.optimizers.items()},
+                    "scalers": self.grad_scaler.state_dict(),
+                },
+                ckpt_path,
+            )
+
+            if delete_others:
+                CONSOLE.log("Delete previous checkpoints.")
+                # delete everything else in the checkpoint folder
+                for f in self.checkpoint_dir.glob("*"):
+                    if f != ckpt_path:
+                        f.unlink()
 
     @profiler.time_function
     def train_iteration(self, step: int) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
@@ -337,6 +357,7 @@ class Trainer:
             writer.put_scalar(name="Eval Loss", scalar=eval_loss, step=step)
             writer.put_dict(name="Eval Loss Dict", scalar_dict=eval_loss_dict, step=step)
             writer.put_dict(name="Eval Metrics Dict", scalar_dict=eval_metrics_dict, step=step)
+            self.save_checkpoint(step, score=eval_metrics_dict[self.config.trainer.checkpoint_measure_metric])
 
         # one eval image
         if step_check(step, self.config.trainer.steps_per_eval_image):

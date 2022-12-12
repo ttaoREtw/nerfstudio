@@ -14,6 +14,13 @@ import open3d as o3d
 import torch
 import tyro
 from rich.console import Console
+from rich.progress import (
+    BarColumn,
+    Progress,
+    TaskProgressColumn,
+    TextColumn,
+    TimeRemainingColumn,
+)
 from typing_extensions import Annotated, Literal
 
 from nerfstudio.cameras.rays import RayBundle
@@ -36,6 +43,7 @@ class Exporter:
     """Path to the config YAML file."""
     output_dir: Path
     """Path to the output directory."""
+    load_step: Optional[int] = None
 
 
 @dataclass
@@ -50,7 +58,7 @@ class ExportVoxelDensity(Exporter):
     """Maximum of the bounding box."""
     sample_points_per_voxel: int = 128
     """Number of sample points to determine the density of each voxels."""
-    vis_alpha_thres: float = 0.99
+    alpha_thres: float = 0.99
     """Alpha threshold."""
     eval_chunk_size: int = 409600
 
@@ -66,28 +74,41 @@ class ExportVoxelDensity(Exporter):
         if not self.output_dir.exists():
             self.output_dir.mkdir(parents=True)
 
-        _, pipeline, _ = eval_setup(self.load_config)
+        _, pipeline, _ = eval_setup(self.load_config, load_step=self.load_step)
+
+        progress = Progress(
+            TextColumn("Computing Voxel Representation"),
+            BarColumn(),
+            TaskProgressColumn(show_speed=True),
+            TimeRemainingColumn(elapsed_when_finished=True, compact=True),
+        )
+
         # (H * W * D, 3)
         pts = self._compute_voxel_grids()
         # (H * W * D, # of samples, 3)
         positions, views = self._create_voxel_samples(pts)
 
         _, num_sample_points_per_voxel, _ = positions.shape
+
+        position_chunks = torch.split(positions, self.eval_chunk_size, dim=0)
+        views_chunks = torch.split(views, self.eval_chunk_size, dim=0)
+
         alpha_all = []
         color_all = []
-        with torch.no_grad():
-            position_chunks = torch.split(positions, self.eval_chunk_size, dim=0)
-            views_chunks = torch.split(views, self.eval_chunk_size, dim=0)
-            for i, (pos, vw) in enumerate(zip(position_chunks, views_chunks)):
-                CONSOLE.print(f"Extracting chunk {i+1}/{len(position_chunks)}...")
-                density, color = pipeline.model.field.get_outputs_from_position(
-                    pos.to(pipeline.model.device), vw.to(pipeline.model.device)
-                )
+        with progress as progress_bar:
+            task = progress_bar.add_task("Generating voxels", total=len(position_chunks))
+            for pos, vw in zip(position_chunks, views_chunks):
+                with torch.no_grad():
+                    density, color = pipeline.model.field.get_outputs_from_position(
+                        pos.to(pipeline.model.device), vw.to(pipeline.model.device)
+                    )
                 density = density.reshape(-1, num_sample_points_per_voxel)
-                alpha = 1.0 - torch.exp(-density)
+                # TODO (ttao): consider render step size
+                alpha = 1.0 - torch.exp(-density)  # pipeline.model.config.render_step_size
                 color = color.reshape(-1, num_sample_points_per_voxel, 3)
                 alpha_all.append(alpha.mean(dim=-1).cpu())
                 color_all.append(color.mean(dim=-2).cpu())
+                progress.advance(task, 1)
 
         alpha = torch.cat(alpha_all, dim=0)
         color = torch.cat(color_all, dim=0)
@@ -96,7 +117,7 @@ class ExportVoxelDensity(Exporter):
         voxel_alpha = alpha.float().numpy()
         voxel_color = color.float().numpy()
 
-        mask = voxel_alpha > self.vis_alpha_thres
+        mask = voxel_alpha > self.alpha_thres
         voxel_position = voxel_position[mask]
         voxel_alpha = voxel_alpha[mask]
         voxel_color = voxel_color[mask]
@@ -104,6 +125,12 @@ class ExportVoxelDensity(Exporter):
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(voxel_position)
         pcd.colors = o3d.utility.Vector3dVector(voxel_color)
+
+        CONSOLE.print(f"Number of points: {len(pcd.points)}")
+        # pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=10.0)
+        # CONSOLE.print(f"Number of points (after remove_statistical_outlier): {len(pcd.points)}")
+        # pcd, _ = pcd.remove_radius_outlier(nb_points=16, radius=0.2)
+        # CONSOLE.print(f"Number of points (after remove_radius_outlier): {len(pcd.points)}")
 
         torch.cuda.empty_cache()
 

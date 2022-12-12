@@ -81,9 +81,11 @@ class ScanNet(DataParser):
         image_filenames = []
         poses = []
         for frame in meta["frames"]:
-            fname = Path(frame["file_path"])
-            image_filenames.append(fname)
-            poses.append(np.array(frame["transform_matrix"]))
+            pose = np.array(frame["transform_matrix"])
+            if np.all(np.isfinite(pose)):
+                poses.append(pose)
+                image_filenames.append(Path(frame["file_path"]))
+
         poses = np.array(poses)
         # Axis align matrix to align world coordinate with room layout.
         axis_align_mat = np.array(meta["axis_align_matrix"])

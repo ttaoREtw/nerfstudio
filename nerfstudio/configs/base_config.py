@@ -142,13 +142,15 @@ class TrainerConfig(PrintableConfig):
     """Number of steps between single eval images."""
     steps_per_eval_all_images: int = 25000
     """Number of steps between eval all images."""
+    checkpoint_measure_metric: str = "psnr"
+    """The metric to ranking checkpoint."""
     max_num_iterations: int = 1000000
     """Maximum number of iterations to run."""
     mixed_precision: bool = False
     """Whether or not to use mixed precision for training."""
     relative_model_dir: Path = Path("nerfstudio_models/")
     """Relative path to save all checkpoints."""
-    save_only_latest_checkpoint: bool = True
+    save_only_latest_checkpoint: bool = False
     """Whether to only save the latest checkpoint or all checkpoints."""
     # optional parameters if we want to resume training
     load_dir: Optional[Path] = None
