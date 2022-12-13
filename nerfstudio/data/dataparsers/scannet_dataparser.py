@@ -99,6 +99,8 @@ class ScanNet(DataParser):
         # Train / eval split
         indices = self._get_split_indices(len(image_filenames), split)
         image_filenames = [image_filenames[i] for i in indices]
+        # Mask out the black border due to some kind of distortion
+        mask_filenames = [self.data / "mask_border_10px.png"] * len(image_filenames)
         poses = poses[indices]
 
         camera_to_world = torch.from_numpy(poses[:, :3].astype(np.float32))
@@ -120,6 +122,7 @@ class ScanNet(DataParser):
 
         dataparser_outputs = DataparserOutputs(
             image_filenames=image_filenames,
+            mask_filenames=mask_filenames,
             cameras=cameras,
             scene_box=scene_box,
         )
