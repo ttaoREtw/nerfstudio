@@ -1,9 +1,10 @@
 import argparse
+import os
 import pathlib
 import random
 import subprocess
 import time
-from typing import Optional
+from typing import List, Optional
 
 from loguru import logger
 
@@ -104,6 +105,10 @@ class Job:
     def command(self):
         return self._cmd
 
+    @command.setter
+    def command(self, cmd):
+        self._cmd = cmd
+
     @property
     def id(self):
         return self._id
@@ -120,8 +125,6 @@ class Job:
         self._id = self._popen.pid
 
     def is_done(self):
-        # import random
-        # return random.choice([True, False])
         if self._popen is None:
             return False
         done = self._popen.poll() is not None
@@ -129,27 +132,54 @@ class Job:
         return done
 
 
-class JobPool:
-    def __init__(self):
-        self._pools = {}
+class Device:
+    def __init__(self, device_id):
+        self._id = device_id
+        self._job = None
+
+    def run(self, job: Job):
+        logger.info(f"Run job {job.id} on {self}")
+        if not self.is_idle:
+            logger.warning(f"{self} is not idle")
+        job.command = self.to_command_prefix() + " " + job.command
+        job.submit()
+        self._job = job
+
+    def is_idle(self):
+        return self._job is None or self._job.is_done()
 
     def __repr__(self):
-        return str(self._pools)
+        return f"cuda-device-{self._id}"
 
-    def add(self, job: Job):
-        logger.info(f"Add job-{job.id} to pool")
-        self._pools[job.id] = job
+    def to_command_prefix(self):
+        return f"CUDA_VISIBLE_DEVICES={self._id}"
 
-    def submit(self):
-        for job in self._pools.values():
-            job.submit()
 
-    def clear(self):
-        logger.info("Clear all jobs")
-        self._pools.clear()
+def _get_available_devices():
+    devices = os.getenv("CUDA_VISIBLE_DEVICES")
+    if devices is None or not devices:
+        return None
+    return sorted(list(set(map(int, devices.strip().split(",")))))
 
-    def is_done(self):
-        return all(job.is_done() for job in self._pools.values())
+
+class DeviceManager:
+    def __init__(self, num_devices):
+        devices = _get_available_devices()
+        if devices is None:
+            devices = [i for i in range(num_devices)]
+
+        self._devices = [Device(i) for i in devices[:num_devices]]
+
+    def assign(self, job: Job):
+        logger.info(f"Assign job {job.id}")
+        for device in self._devices:
+            if device.is_idle():
+                device.run(job)
+                return
+        logger.warning(f"Failed to assign job {job.id}")
+
+    def is_any_idle(self):
+        return any(device.is_idle() for device in self._devices)
 
 
 def read_scene_list(path: pathlib.Path, shuffle):
@@ -166,37 +196,32 @@ def run(args):
     output_dir.mkdir(exist_ok=True)
     output_log_dir = output_dir / "logs"
     output_log_dir.mkdir(exist_ok=True)
-    num_jobs_per_time = args.num_gpus
+    num_gpus = args.num_gpus
 
     exp_name = "v0"
     scenes = read_scene_list(args.scene_list, shuffle=True)
     scenes = [args.data_root / name for name in scenes]
     scenes = list(filter(lambda path: path.exists(), scenes))
 
-    job_pool = JobPool()
-    for i in range(0, len(scenes), num_jobs_per_time):
-        for j in range(num_jobs_per_time):
-            k = i + j
-            if k < len(scenes):
-                if not scene_is_done(exp_name, scenes[k], output_dir, args.max_num_iterations):
-                    cmd = get_command(
-                        exp_name,
-                        scenes[k],
-                        output_dir,
-                        output_log_dir,
-                        steps_per_save=args.steps_per_save,
-                        max_num_iterations=args.max_num_iterations,
-                        cuda_id=j,
-                    )
-                    job_pool.add(Job(cmd))
-        job_pool.submit()
-
-        while not job_pool.is_done():
+    device_manager = DeviceManager(num_gpus)
+    i = 0
+    while i < len(scenes):
+        if device_manager.is_any_idle():
+            if not scene_is_done(exp_name, scenes[i], output_dir, args.max_num_iterations):
+                cmd = get_command(
+                    exp_name,
+                    scenes[i],
+                    output_dir,
+                    output_log_dir,
+                    steps_per_save=args.steps_per_save,
+                    max_num_iterations=args.max_num_iterations,
+                )
+                device_manager.assign(Job(cmd))
+            i += 1
+        else:
             wait_sec = 30
             logger.info(f"Sleep {wait_sec} sec...")
             time.sleep(wait_sec)
-
-        job_pool.clear()
 
 
 if __name__ == "__main__":
