@@ -52,30 +52,34 @@ class ExportVoxelDensity(Exporter):
 
     number_voxel: Tuple[int, int, int] = (256, 256, 128)
     """Output voxel size."""
-    bounding_box_min: Tuple[float, float, float] = (-1, -1, -1)
-    """Minimum of the bounding box."""
-    bounding_box_max: Tuple[float, float, float] = (1, 1, 1)
-    """Maximum of the bounding box."""
+    aabb_margin_max: Tuple[float, float, float] = (1.5, 1.5, 1)
+    """Margin of aabb scene box."""
+    aabb_margin_min: Tuple[float, float, float] = (1.5, 1.5, 2)
+    """Margin of aabb scene box."""
     sample_points_per_voxel: int = 128
     """Number of sample points to determine the density of each voxels."""
-    alpha_thres: float = 0.99
-    """Alpha threshold."""
+    min_valid_voxels: int = 300000
+    """Minimum number of valid voxels (points)."""
     eval_chunk_size: int = 409600
 
     def __post_init__(self):
-        number_voxel, voxel_size, xyz_min, xyz_max = self._compute_world_meta()
-        self.number_voxel = number_voxel
-        self.voxel_size = voxel_size
-        self.xyz_min = xyz_min
-        self.xyz_max = xyz_max
-
-    def main(self) -> None:
-        """Export occupancy grid."""
         if not self.output_dir.exists():
             self.output_dir.mkdir(parents=True)
 
         _, pipeline, _ = eval_setup(self.load_config, load_step=self.load_step)
 
+        number_voxel, voxel_size, xyz_min, xyz_max = self._compute_world_meta(pipeline)
+        self.number_voxel = number_voxel
+        self.voxel_size = voxel_size
+        self.xyz_min = xyz_min
+        self.xyz_max = xyz_max
+        self.pipeline = pipeline
+
+        CONSOLE.print(f"World: min={xyz_min}, max={xyz_max}, voxel_size={voxel_size}, num_voxels={number_voxel}")
+
+    def main(self) -> None:
+        """Export occupancy grid."""
+        
         progress = Progress(
             TextColumn("Computing Voxel Representation"),
             BarColumn(),
@@ -99,12 +103,12 @@ class ExportVoxelDensity(Exporter):
             task = progress_bar.add_task("Generating voxels", total=len(position_chunks))
             for pos, vw in zip(position_chunks, views_chunks):
                 with torch.no_grad():
-                    density, color = pipeline.model.field.get_outputs_from_position(
-                        pos.to(pipeline.model.device), vw.to(pipeline.model.device)
+                    density, color = self.pipeline.model.field.get_outputs_from_position(
+                        pos.to(self.pipeline.model.device), vw.to(self.pipeline.model.device)
                     )
                 density = density.reshape(-1, num_sample_points_per_voxel)
                 # TODO (ttao): consider render step size
-                alpha = 1.0 - torch.exp(-density)  # pipeline.model.config.render_step_size
+                alpha = 1.0 - torch.exp(-density * self.pipeline.model.config.render_step_size)
                 color = color.reshape(-1, num_sample_points_per_voxel, 3)
                 alpha_all.append(alpha.mean(dim=-1).cpu())
                 color_all.append(color.mean(dim=-2).cpu())
@@ -113,14 +117,13 @@ class ExportVoxelDensity(Exporter):
         alpha = torch.cat(alpha_all, dim=0)
         color = torch.cat(color_all, dim=0)
 
-        voxel_position = pts.float().numpy()
-        voxel_alpha = alpha.float().numpy()
-        voxel_color = color.float().numpy()
+        alpha_thres = self._compute_alpha_thres(alpha)
+        CONSOLE.print(f"Alpha threshold: {alpha_thres}")
 
-        mask = voxel_alpha > self.alpha_thres
-        voxel_position = voxel_position[mask]
-        voxel_alpha = voxel_alpha[mask]
-        voxel_color = voxel_color[mask]
+        mask = alpha > alpha_thres
+        voxel_position = pts[mask].numpy()
+        voxel_alpha = alpha[mask].numpy()
+        voxel_color = color[mask].numpy()
 
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(voxel_position)
@@ -140,11 +143,40 @@ class ExportVoxelDensity(Exporter):
         print("\033[A\033[A")
         CONSOLE.print("[bold green]:white_check_mark: Saving voxel")
 
-    def _compute_world_meta(self):
-        number_voxel = torch.tensor(self.number_voxel).long()
-        xyz_min = torch.tensor(self.bounding_box_min).float()
-        xyz_max = torch.tensor(self.bounding_box_max).float()
+    def _compute_aabb(self, pipeline):
+        camera_min_xyz = torch.tensor([torch.inf, torch.inf, torch.inf])
+        camera_max_xyz = torch.tensor([-torch.inf, -torch.inf, -torch.inf])
+        c2w_list = torch.cat([
+            pipeline.datamanager.train_dataset.cameras.camera_to_worlds,
+            pipeline.datamanager.eval_dataset.cameras.camera_to_worlds
+            ], dim=0)
+
+        avg_height = 0
+        for i, c2w in enumerate(c2w_list):
+            cam_pos = c2w[:3, 3]
+            camera_min_xyz = torch.min(cam_pos, camera_min_xyz)
+            camera_max_xyz = torch.max(cam_pos, camera_max_xyz)
+            # Moving average
+            avg_height = (avg_height * i + cam_pos[2]) / (i + 1)
+        return camera_min_xyz, camera_max_xyz, avg_height
+
+    def _compute_alpha_thres(self, voxel_alpha):
+        _scan_resolution = 1000
+        scan_thres_list = torch.linspace(1., 0., _scan_resolution).tolist()
+        for thres in scan_thres_list:
+            if (voxel_alpha > thres).sum() > self.min_valid_voxels:
+                return thres
+        return 1.
+
+    def _compute_world_meta(self, pipeline):
+        xyz_min, xyz_max, avg_height = self._compute_aabb(pipeline)
+        xyz_min -= torch.tensor(self.aabb_margin_min)
+        xyz_max += torch.tensor(self.aabb_margin_max)
+        # Fixed the z-dim boundary of scene box
+        xyz_min[2] = avg_height - self.aabb_margin_min[2]
+        xyz_max[2] = avg_height + self.aabb_margin_max[2]
         scene_length = xyz_max - xyz_min
+        number_voxel = torch.tensor(self.number_voxel).long()
         voxel_size = scene_length / number_voxel
         return (number_voxel, voxel_size, xyz_min, xyz_max)
 
@@ -172,6 +204,7 @@ class ExportVoxelDensity(Exporter):
         # Scale the points to fit the scene
         pts = pts * self.voxel_size
         # Shift the min point to xyz_min
+        # world_center = (self.xyz_max + self.xyz_min) / 2.
         pts = pts + self.xyz_min
         # Shift each point to the center of voxels
         pts = pts + self.voxel_size / 2.0
